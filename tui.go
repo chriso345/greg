@@ -22,6 +22,8 @@ type model struct {
 	width       int
 	height      int
 	windowStart int
+	cursorStack  []int
+	windowStartStack []int
 	config      *Config
 
 	mode       string
@@ -52,7 +54,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.current = m.menuStack[len(m.menuStack)-1]
 				m.menuStack = m.menuStack[:len(m.menuStack)-1]
 				m.updateMenuLabels()
-				m.cursor = 0
+				// restore cursor/windowStart if available
+				if len(m.cursorStack) > 0 {
+					restored := m.cursorStack[len(m.cursorStack)-1]
+					m.cursorStack = m.cursorStack[:len(m.cursorStack)-1]
+					if restored >= len(m.filtered) {
+						if len(m.filtered) == 0 {
+							m.cursor = -1
+						} else {
+							m.cursor = len(m.filtered) - 1
+						}
+					} else {
+						m.cursor = restored
+					}
+				} else {
+					m.cursor = 0
+				}
+				if len(m.windowStartStack) > 0 {
+					restoredWS := m.windowStartStack[len(m.windowStartStack)-1]
+					m.windowStartStack = m.windowStartStack[:len(m.windowStartStack)-1]
+					if restoredWS >= len(m.filtered) {
+						m.windowStart = 0
+					} else {
+						m.windowStart = restoredWS
+					}
+				} else {
+					m.windowStart = 0
+				}
 				return m, nil
 			}
 			m.cursor = -1
@@ -80,10 +108,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					// SUBMENU
 					if len(item.Items) > 0 {
+						// save cursor/windowStart for restoration when returning
+						m.cursorStack = append(m.cursorStack, m.cursor)
+						m.windowStartStack = append(m.windowStartStack, m.windowStart)
 						m.menuStack = append(m.menuStack, m.current)
 						m.current = item.Items
 						m.updateMenuLabels()
 						m.cursor = 0
+						m.windowStart = 0
 						return m, nil
 					}
 
@@ -91,10 +123,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if item.Generator != "" {
 						gen, err := expandGenerator(item.Generator)
 						if err == nil {
+							// save cursor/windowStart for restoration when returning
+							m.cursorStack = append(m.cursorStack, m.cursor)
+							m.windowStartStack = append(m.windowStartStack, m.windowStart)
 							m.menuStack = append(m.menuStack, m.current)
 							m.current = gen
 							m.updateMenuLabels()
 							m.cursor = 0
+							m.windowStart = 0
 						}
 						return m, nil
 					}
