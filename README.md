@@ -109,5 +109,3 @@ help = "240"      # dim gray
 ## License
 
 Licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
----

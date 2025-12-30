@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -13,18 +14,28 @@ import (
 var pendingExec string
 var pendingVisible bool
 
+// timeoutMsg signals the TUI to exit due to inactivity
+type timeoutMsg struct{}
+
+// timeout reset channel used by TUI to reset inactivity timer
+var timeoutResetCh chan struct{}
+
 type model struct {
+	// inactivity timeout in seconds (0 disables)
+	timeout int
+	// dry-run: do not execute actions, only print selection/command
+	dryRun bool
 	// generic TUI fields
-	allItems    []string
-	filtered    []string
-	cursor      int
-	input       string
-	width       int
-	height      int
-	windowStart int
-	cursorStack  []int
+	allItems         []string
+	filtered         []string
+	cursor           int
+	input            string
+	width            int
+	height           int
+	windowStart      int
+	cursorStack      []int
 	windowStartStack []int
-	config      *Config
+	config           *Config
 
 	mode       string
 	prompt     string
@@ -39,13 +50,24 @@ type model struct {
 	labels     []string
 }
 
-func (m model) Init() tea.Cmd { return tea.EnterAltScreen }
+func (m model) Init() tea.Cmd {
+	// EnterAltScreen and no-op; timeout handling is managed externally via program's Start
+	return tea.EnterAltScreen
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch ev := msg.(type) {
 
 	case tea.KeyMsg:
 		key := ev.String()
+
+		// reset inactivity timer on any key press
+		if timeoutResetCh != nil {
+			select {
+			case timeoutResetCh <- struct{}{}:
+			default:
+			}
+		}
 
 		// ESC
 		if key == "esc" {
@@ -184,6 +206,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = ev.Width
 		m.height = ev.Height
+
+	// timeout triggered
+	case timeoutMsg:
+		m.cursor = -1
+		return m, tea.Quit
 	}
 
 	return m, nil
@@ -243,26 +270,57 @@ func (m model) View() string {
 	end := min(start+m.config.MaxItems, len(m.filtered))
 	visible := m.filtered[start:end]
 
-	list := ""
+	var list strings.Builder
 	for i, item := range visible {
 		if start+i == m.cursor {
-			list += selectedStyle.Render(" > "+item) + "\n"
+			list.WriteString(selectedStyle.Render(" > "+item) + "\n")
 		} else {
-			list += itemStyle.Render("   "+item) + "\n"
+			list.WriteString(itemStyle.Render("   "+item) + "\n")
 		}
 	}
 
 	if len(m.filtered) == 0 {
-		list += helpStyle.Render("   no matches found")
+		list.WriteString(helpStyle.Render("   no matches found"))
 	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left, header, prompt, list)
+	content := lipgloss.JoinVertical(lipgloss.Left, header, prompt, list.String())
 	return lipgloss.NewStyle().Margin(1, 2).Render(content)
 }
 
 func RunTUIWithItems(cfg *Config, mode model, items []string, apps []AppEntry) (string, error) {
 	p := tea.NewProgram(mode, tea.WithAltScreen())
+	// setup reset channel and start inactivity timer if requested
+	var done chan struct{}
+	if mode.timeout > 0 {
+		done = make(chan struct{})
+		timeoutResetCh = make(chan struct{}, 1)
+		// timer goroutine
+		go func() {
+			d := time.Duration(mode.timeout) * time.Second
+			t := time.NewTimer(d)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					p.Send(timeoutMsg{})
+					return
+				case <-timeoutResetCh:
+					if !t.Stop() {
+						<-t.C
+					}
+					t.Reset(d)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
 	m, err := p.Run()
+	// stop timer goroutine
+	if mode.timeout > 0 {
+		close(done)
+		timeoutResetCh = nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -291,6 +349,10 @@ func RunTUIWithItems(cfg *Config, mode model, items []string, apps []AppEntry) (
 	case "apps":
 		for _, app := range apps {
 			if app.Name == selected {
+				if mod.dryRun {
+					fmt.Println(selected)
+					return "", nil
+				}
 				return "", launchDesktopFile(app.Path)
 			}
 		}
@@ -302,33 +364,35 @@ func RunTUIWithItems(cfg *Config, mode model, items []string, apps []AppEntry) (
 	return "", nil
 }
 
-func initialModelWithItems(cfg *Config, args *CLIArgs, items []string) model {
-	prompt := args.Prompt.Value
+func initialModelWithItems(cfg *Config, mode string, prompt string, out string, header string, items []string) model {
+	// default timeout is 0 (disabled)
+	// Defaults
 	if prompt == "" {
 		prompt = "search>"
 	}
-
-	header := args.Header.Value
-	helpText := ""
 	if header == "" {
 		header = "greg"
-		helpText = " - type to filter, ↑↓ to move, enter to select"
+	}
+	helpText := " - type to filter, ↑↓ to move, enter to select"
+	if mode == "menu" {
+		helpText = " - type to filter, ↑↓ to move, enter to select, esc to go back"
 	}
 
 	return model{
 		allItems:    items,
 		filtered:    items,
 		config:      cfg,
-		mode:        args.Mode.Value,
+		mode:        mode,
 		prompt:      prompt,
-		out:         args.Out.Value,
+		out:         out,
 		mainHeader:  header,
 		helpText:    helpText,
 		windowStart: 0,
 	}
 }
 
-func initialPersistentMenuModel(cfg *Config, _ *CLIArgs, menu *MenuConfig) model {
+func initialPersistentMenuModel(cfg *Config, args *CLIArgs, menu *MenuConfig) model {
+	// default timeout is 0 (disabled)
 	prompt := menu.Prompt
 	if prompt == "" {
 		prompt = "search>"
@@ -349,13 +413,15 @@ func initialPersistentMenuModel(cfg *Config, _ *CLIArgs, menu *MenuConfig) model
 		isMenuMode: true,
 		current:    menu.Menu,
 		menuStack:  [][]Menu{},
+		// set timeout and dry-run from CLI args if present
+		timeout: args.Menu.Timeout.Value,
+		dryRun:  args.Menu.DryRun.Value,
 	}
 
 	m.updateMenuLabels()
 	return m
 }
 
-// / -------------------------------------------------------------------------
 func (m *model) updateMenuLabels() {
 	m.input = ""
 	m.labels = m.labels[:0]

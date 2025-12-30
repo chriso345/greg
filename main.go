@@ -18,21 +18,70 @@ type AppEntry struct {
 func main() {
 	args := ParseArgs()
 
-	cfg, err := LoadConfig()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Warning: using default config -", err)
+	if os.Getenv("GREG_DEBUG_ARGS") == "1" {
+		fmt.Fprintf(os.Stderr, "DEBUG ARGS: %+v\n", args)
+		os.Exit(1)
+	}
+
+	// Determine active subcommand
+	modeName := ""
+	if args.Menu.Subcommand {
+		modeName = "menu"
+	} else if args.Dmenu.Subcommand {
+		modeName = "dmenu"
+	} else if args.Apps.Subcommand {
+		modeName = "apps"
+	} else {
+		modeName = "apps"
+	}
+
+	// Load config unless menu --no-config was requested
+	var cfg *Config
+	var err error
+	if modeName == "menu" && args.Menu.NoConfig.Value {
 		cfg = defaultConfig()
+	} else {
+		cfg, err = LoadConfig()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: using default config -", err)
+			cfg = defaultConfig()
+		}
+	}
+
+	// Apply per-subcommand flags to config
+	switch modeName {
+	case "menu":
+		if args.Menu.MaxItems.Value != 0 {
+			cfg.MaxItems = args.Menu.MaxItems.Value
+		}
+		if args.Menu.LogLevel.Value != "" {
+			lvl := args.Menu.LogLevel.Value
+			cfg.Log = !(lvl == "error" || lvl == "warn")
+		}
+	case "dmenu":
+		if args.Dmenu.MaxItems.Value != 0 {
+			cfg.MaxItems = args.Dmenu.MaxItems.Value
+		}
+		if args.Dmenu.LogLevel.Value != "" {
+			lvl := args.Dmenu.LogLevel.Value
+			cfg.Log = !(lvl == "error" || lvl == "warn")
+		}
+	case "apps":
+		if args.Apps.LogLevel.Value != "" {
+			lvl := args.Apps.LogLevel.Value
+			cfg.Log = !(lvl == "error" || lvl == "warn")
+		}
 	}
 
 	var items []string
 	var appEntries []AppEntry
 
-	switch args.Mode.Value {
+	switch modeName {
 	case "dmenu":
 		// Ensure piped input
 		stat, _ := os.Stdin.Stat()
 		if (stat.Mode() & os.ModeCharDevice) != 0 {
-			fmt.Fprintln(os.Stderr, "Error: expected piped input, e.g., `ls | greg -m dmenu`.")
+			fmt.Fprintln(os.Stderr, "Error: expected piped input, e.g., `ls | greg dmenu`.")
 			os.Exit(1)
 		}
 
@@ -51,11 +100,11 @@ func main() {
 			os.Exit(1)
 		}
 
-		if args.Start.Value != "" {
-			subMenu := findMenuByID(mnu.Menu, args.Start.Value)
+		if args.Menu.Start.Value != "" {
+			subMenu := findMenuByID(mnu.Menu, args.Menu.Start.Value)
 			if subMenu == nil {
 				// Shouldn't be fatal
-				fmt.Fprintf(os.Stderr, "Warning: submenu with ID '%s' not found. Starting from root menu.\n", args.Start.Value)
+				fmt.Fprintf(os.Stderr, "Warning: submenu with ID '%s' not found. Starting from root menu.\n", args.Menu.Start.Value)
 			} else {
 				mnu.Menu = subMenu.Items
 			}
@@ -64,12 +113,13 @@ func main() {
 		runMenu(mnu, cfg, args)
 		os.Exit(0)
 
-	// Use apps mode if no mode is specified
 	case "apps":
-		fallthrough
-	case "":
-		args.Mode.Value = "apps"
-		appEntries, err = readDesktopFiles("/home/chris/.local/share/applications")
+		// apps: load .desktop files, allow override via flag
+		dir := "/home/chris/.local/share/applications"
+		if args.Apps.DesktopDir.Value != "" {
+			dir = args.Apps.DesktopDir.Value
+		}
+		appEntries, err = readDesktopFiles(dir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error reading .desktop files:", err)
 			os.Exit(1)
@@ -85,7 +135,7 @@ func main() {
 		}
 
 	default:
-		fmt.Fprintln(os.Stderr, "Error: unknown mode. Supported modes: dmenu, apps")
+		fmt.Fprintln(os.Stderr, "Error: unknown mode. Supported modes: dmenu, menu, apps")
 		os.Exit(1)
 	}
 
@@ -95,7 +145,36 @@ func main() {
 		fmt.Printf("[DEBUG] Total apps loaded: %d\n", len(appEntries))
 	}
 
-	mode := initialModelWithItems(cfg, args, items)
+	// Determine prompt/out/header to pass into TUI
+	var finalPrompt, finalOut, finalHeader string
+	switch modeName {
+	case "menu":
+		finalPrompt = args.Menu.Prompt.Value
+		finalOut = args.Menu.Out.Value
+		finalHeader = args.Menu.Header.Value
+	case "dmenu":
+		finalPrompt = args.Dmenu.Prompt.Value
+		finalOut = args.Dmenu.Out.Value
+		finalHeader = ""
+	default: // apps
+		finalPrompt = ""
+		finalOut = ""
+		finalHeader = ""
+	}
+
+	mode := initialModelWithItems(cfg, modeName, finalPrompt, finalOut, finalHeader, items)
+	// set timeout and dry-run from CLI flags per subcommand
+	switch modeName {
+	case "menu":
+		mode.timeout = args.Menu.Timeout.Value
+		mode.dryRun = args.Menu.DryRun.Value
+	case "dmenu":
+		mode.timeout = args.Dmenu.Timeout.Value
+		mode.dryRun = args.Dmenu.DryRun.Value
+	case "apps":
+		// apps has no timeout flag; keep default 0
+		mode.dryRun = args.Apps.DryRun.Value
+	}
 	if _, err := RunTUIWithItems(cfg, mode, items, appEntries); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)

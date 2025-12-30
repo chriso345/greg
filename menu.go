@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,15 +46,10 @@ func findMenuByID(menus []Menu, id string) *Menu {
 }
 
 func runMenu(menuConfig *MenuConfig, cfg *Config, args *CLIArgs) {
-	// persistent TUI only for menu mode
-	if args.Mode.Value == "menu" {
-		if err := RunPersistentMenuTUI(cfg, args, menuConfig); err != nil {
-			fmt.Fprintln(os.Stderr, "Menu TUI error:", err)
-		}
-		return
+	// persistent TUI only for menu mode; caller must ensure correct mode
+	if err := RunPersistentMenuTUI(cfg, args, menuConfig); err != nil {
+		fmt.Fprintln(os.Stderr, "Menu TUI error:", err)
 	}
-
-	fmt.Println("Error: runMenu should only be used in menu mode")
 }
 
 func expandGenerator(cmdStr string) ([]Menu, error) {
@@ -126,8 +122,44 @@ func loadMenu() (*MenuConfig, error) {
 func RunPersistentMenuTUI(cfg *Config, args *CLIArgs, menu *MenuConfig) error {
 	m := initialPersistentMenuModel(cfg, args, menu)
 	p := tea.NewProgram(m, tea.WithAltScreen())
+	// setup reset channel and start inactivity timer if requested
+	var done chan struct{}
+	if m.timeout > 0 {
+		done = make(chan struct{})
+		timeoutResetCh = make(chan struct{}, 1)
+		go func() {
+			d := time.Duration(m.timeout) * time.Second
+			t := time.NewTimer(d)
+			defer t.Stop()
+			for {
+				select {
+				case <-t.C:
+					p.Send(timeoutMsg{})
+					return
+				case <-timeoutResetCh:
+					if !t.Stop() {
+						<-t.C
+					}
+					t.Reset(d)
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
 	_, err := p.Run()
+	// stop timer goroutine
+	if m.timeout > 0 {
+		close(done)
+		timeoutResetCh = nil
+	}
 	if pendingExec != "" {
+		// respect dry-run flag for menu mode
+		if args.Menu.DryRun.Value {
+			fmt.Fprintln(os.Stdout, "DRY-RUN:", pendingExec)
+			pendingExec = ""
+			return err
+		}
 		execErr := executeCommand(pendingExec, pendingVisible)
 		pendingExec = ""
 		if execErr != nil {

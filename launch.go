@@ -41,5 +41,9 @@ func launchDesktopFile(path string) error {
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
+	if os.Getenv("GREG_DRY_RUN") == "1" {
+		fmt.Fprintln(os.Stdout, "DRY-RUN-EXEC:", execLine)
+		return nil
+	}
 	return cmd.Start()
 }
